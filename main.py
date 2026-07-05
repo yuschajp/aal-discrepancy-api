@@ -122,6 +122,10 @@ FLOAT_RATE_ALIASES = {
     "us sofr": "SOFR",
     # LIBOR variants
     "usd-libor-bba": "LIBOR-3M",
+    "usd-libor-bba-3m": "LIBOR-3M",
+    "usd-libor-bba-6m": "LIBOR-6M",
+    "usd-libor-bba-1m": "LIBOR-1M",
+    "usd-libor-bba-12m": "LIBOR-12M",
     "usd-libor": "LIBOR-3M",
     "libor": "LIBOR-3M",
     "libor-bba": "LIBOR-3M",
