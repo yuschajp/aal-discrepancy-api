@@ -3,11 +3,9 @@
 AAL Discrepancy Detection API v2
 FastAPI — IRS + Equity Option confirmation discrepancy detection.
 
-v2 changes:
-  - EQUITY_OPTION asset class routing to EquityOptionReconciler
-  - Equity option extraction prompt (index options, call spreads)
-  - Asset-class-aware ExpectedEconomics model
-  - Both engines share the same endpoint, response envelope, and auth
+v2.1 changes:
+  - EQ extraction: counterparty = Party A (dealer/bank), not Party B (buy-side)
+    Aligns with how insurance company OMS books the trade: dealer as counterparty.
 
 Architecture (Decision Log 2026-07-04/05):
   POST /v1/confirmations/validate
@@ -30,7 +28,7 @@ from equity_option_reconciler import EquityOptionReconciler, normalize_index
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 AAL_API_KEY       = os.environ.get("AAL_API_KEY", "dev-key-replace-in-prod")
 MODEL             = "claude-haiku-4-5-20251001"
-API_VERSION       = "aal-disc-v2.0"
+API_VERSION       = "aal-disc-v2.1"
 
 client      = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 irs_engine  = IRSReconciler()
@@ -39,7 +37,7 @@ eq_engine   = EquityOptionReconciler()
 app = FastAPI(
     title="AAL Discrepancy Detection API",
     description="Deterministic IRS and equity option confirmation discrepancy detection.",
-    version="2.0.0",
+    version="2.1.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -59,13 +57,11 @@ async def require_api_key(key: str = Security(api_key_header)):
 # Request / Response models
 # ---------------------------------------------------------------------------
 class ExpectedEconomics(BaseModel):
-    # Shared
     asset_class:   Literal["IRS", "EQUITY_OPTION"] = "IRS"
     counterparty:  Optional[str]   = None
     trade_date:    Optional[str]   = None
     currency:      Optional[str]   = None
     notional:      Optional[float] = None
-    # IRS fields
     fixed_rate:              Optional[float] = None
     floating_rate:           Optional[str]   = None
     effective_date:          Optional[str]   = None
@@ -74,10 +70,9 @@ class ExpectedEconomics(BaseModel):
     payment_frequency_float: Optional[str]   = None
     day_count_fixed:         Optional[str]   = None
     day_count_float:         Optional[str]   = None
-    # Equity option fields
-    option_type:        Optional[str]   = None   # "call" | "put"
-    option_style:       Optional[str]   = None   # "european" | "american"
-    underlying:         Optional[str]   = None   # "SPX" | "RTY" etc
+    option_type:        Optional[str]   = None
+    option_style:       Optional[str]   = None
+    underlying:         Optional[str]   = None
     strike:             Optional[float] = None
     strike_high:        Optional[float] = None
     num_options:        Optional[float] = None
@@ -88,7 +83,6 @@ class ExpectedEconomics(BaseModel):
     settlement_method:  Optional[str]   = None
     buyer:              Optional[str]   = None
     seller:             Optional[str]   = None
-    # Insurance metadata (pass-through, not reconciled)
     policy_cohort:      Optional[str]   = None
     hedge_program:      Optional[str]   = None
 
@@ -218,7 +212,7 @@ Extract these fields (use null if absent or ambiguous):
 }
 Rules:
 - Dates always YYYY-MM-DD.
-- underlying: normalize to canonical code regardless of how written:
+- underlying: normalize to canonical code:
     "S&P 500 Index", "S&P500", "SPX Index" → "SPX"
     "Russell 2000", "Russell 2000 Index" → "RTY"
     "Nasdaq-100", "NASDAQ 100" → "NDX"
@@ -229,16 +223,18 @@ Rules:
 - option_type: always lowercase "call" or "put".
 - option_style: always lowercase "european" or "american".
 - For call spreads: strike = lower strike, strike_high = upper strike (cap level).
-- counterparty: the insurance company or buy-side firm — not the dealer/bank.
-  If document says "Party A: Standard Chartered Bank" and "Party B: [client]",
-  extract Party B as counterparty.
+- counterparty: extract Party A (the dealer/bank) as the counterparty field.
+  In equity option confirmations, Party A is always the dealer. Party B is the
+  buy-side client (insurance company, asset manager). From the buy-side perspective,
+  the dealer is their counterparty — matching how their OMS books the trade.
+  Example: "Party A: Standard Chartered Bank" → counterparty = "Standard Chartered Bank".
 - premium: total dollar amount of the option premium, not per-option.
-- settlement_method: "cash" for cash-settled index options (most common for FIA/RILA hedges).
+- settlement_method: "cash" for cash-settled index options.
 - Internal fields (book, account, hedge program) never appear in dealer confirmations.
 """
 
 # ---------------------------------------------------------------------------
-# Salvage JSON parser (shared)
+# Salvage JSON parser
 # ---------------------------------------------------------------------------
 def _salvage_json(raw: str) -> dict:
     try:
@@ -281,7 +277,6 @@ def extract_fields(confirmation_text: str, asset_class: str) -> tuple[dict, floa
         raw = re.sub(r"\s*```$", "", raw)
         extracted = _salvage_json(raw)
         confidence = float(extracted.pop("extraction_confidence", 0.85))
-        # Post-extraction normalization
         if asset_class == "IRS" and "floating_rate" in extracted:
             extracted["floating_rate"] = normalize_floating_rate(extracted["floating_rate"])
         if asset_class == "EQUITY_OPTION" and "underlying" in extracted:
@@ -314,17 +309,14 @@ async def validate_confirmation(req: ValidateRequest):
     match_id = str(uuid.uuid4())
     asset_class = req.expected_economics.asset_class
 
-    # Step 1 — extract
     extracted, confidence = extract_fields(req.confirmation_text, asset_class)
 
-    # Step 2 — route to correct engine
     internal_dict = req.expected_economics.model_dump(exclude_none=True)
     if asset_class == "EQUITY_OPTION":
         result = eq_engine.reconcile(extracted, internal_dict, case_id=match_id)
     else:
         result = irs_engine.reconcile(extracted, internal_dict, case_id=match_id)
 
-    # Step 3 — build response
     threshold_rank = {"low": 0, "medium": 1, "high": 2}
     threshold = req.options.severity_threshold
     discrepancies = []
@@ -345,15 +337,12 @@ async def validate_confirmation(req: ValidateRequest):
         "review_required"
     )
 
-    # Insurance metadata pass-through
     metadata = None
     if req.expected_economics.policy_cohort or req.expected_economics.hedge_program:
-        metadata = {
-            k: v for k, v in {
-                "policy_cohort": req.expected_economics.policy_cohort,
-                "hedge_program": req.expected_economics.hedge_program,
-            }.items() if v
-        }
+        metadata = {k: v for k, v in {
+            "policy_cohort": req.expected_economics.policy_cohort,
+            "hedge_program": req.expected_economics.hedge_program,
+        }.items() if v}
 
     return ValidateResponse(
         match_id=match_id,
