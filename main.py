@@ -1,43 +1,60 @@
 #!/usr/bin/env python3
 """
-AAL Discrepancy Detection API v2
-FastAPI — IRS + Equity Option confirmation discrepancy detection.
+AAL Discrepancy Detection API v3
+FastAPI — Full capital markets confirmation discrepancy detection.
 
-v2.1 changes:
-  - EQ extraction: counterparty = Party A (dealer/bank), not Party B (buy-side)
-    Aligns with how insurance company OMS books the trade: dealer as counterparty.
+Asset classes: IRS, EQUITY_OPTION, FIXED_INCOME, CAP_FLOOR, TRS, CDS
+
+v3 changes:
+  - Added FIXED_INCOME, CAP_FLOOR, TRS, CDS engines and extraction prompts
+  - Unified asset class router
+  - All six engines live behind single endpoint
 
 Architecture (Decision Log 2026-07-04/05):
   POST /v1/confirmations/validate
     → [1] LLM extraction (Claude Haiku) — NER/classification only
-    → [2] Asset class router → IRS or EQUITY_OPTION reconciler
+    → [2] Asset class router → correct reconciler
     → [3] Severity rule table — no LLM touches arithmetic
     → Response
 """
 
 import os, uuid, time, json, re
-from typing import Optional, Literal, Union
+from typing import Optional, Literal
 from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import anthropic
-from irs_reconciler import IRSReconciler
+
+from irs_reconciler          import IRSReconciler
 from equity_option_reconciler import EquityOptionReconciler, normalize_index
+from fixed_income_reconciler  import FixedIncomeReconciler
+from cap_floor_reconciler     import CapFloorReconciler
+from trs_reconciler           import TRSReconciler
+from cds_reconciler           import CDSReconciler
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 AAL_API_KEY       = os.environ.get("AAL_API_KEY", "dev-key-replace-in-prod")
 MODEL             = "claude-haiku-4-5-20251001"
-API_VERSION       = "aal-disc-v2.1"
+API_VERSION       = "aal-disc-v3.0"
 
-client      = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-irs_engine  = IRSReconciler()
-eq_engine   = EquityOptionReconciler()
+client     = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+ENGINES    = {
+    "IRS":           IRSReconciler(),
+    "EQUITY_OPTION": EquityOptionReconciler(),
+    "FIXED_INCOME":  FixedIncomeReconciler(),
+    "CAP_FLOOR":     CapFloorReconciler(),
+    "TRS":           TRSReconciler(),
+    "CDS":           CDSReconciler(),
+}
+
+ASSET_CLASSES = list(ENGINES.keys())
 
 app = FastAPI(
     title="AAL Discrepancy Detection API",
-    description="Deterministic IRS and equity option confirmation discrepancy detection.",
-    version="2.1.0",
+    description="Deterministic capital markets confirmation discrepancy detection. "
+                "Covers IRS, equity options, fixed income, caps/floors, TRS, and CDS.",
+    version="3.0.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -54,37 +71,85 @@ async def require_api_key(key: str = Security(api_key_header)):
     return key
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Models
 # ---------------------------------------------------------------------------
 class ExpectedEconomics(BaseModel):
-    asset_class:   Literal["IRS", "EQUITY_OPTION"] = "IRS"
-    counterparty:  Optional[str]   = None
-    trade_date:    Optional[str]   = None
-    currency:      Optional[str]   = None
-    notional:      Optional[float] = None
+    asset_class: Literal[
+        "IRS", "EQUITY_OPTION", "FIXED_INCOME", "CAP_FLOOR", "TRS", "CDS"
+    ] = "IRS"
+    # Shared
+    counterparty:    Optional[str]   = None
+    trade_date:      Optional[str]   = None
+    currency:        Optional[str]   = None
+    notional:        Optional[float] = None
+    effective_date:  Optional[str]   = None
+    # IRS
     fixed_rate:              Optional[float] = None
     floating_rate:           Optional[str]   = None
-    effective_date:          Optional[str]   = None
     maturity_date:           Optional[str]   = None
     payment_frequency_fixed: Optional[str]   = None
     payment_frequency_float: Optional[str]   = None
     day_count_fixed:         Optional[str]   = None
     day_count_float:         Optional[str]   = None
-    option_type:        Optional[str]   = None
-    option_style:       Optional[str]   = None
-    underlying:         Optional[str]   = None
-    strike:             Optional[float] = None
-    strike_high:        Optional[float] = None
-    num_options:        Optional[float] = None
-    premium:            Optional[float] = None
-    premium_per_option: Optional[float] = None
-    expiry_date:        Optional[str]   = None
-    settlement_currency: Optional[str] = None
-    settlement_method:  Optional[str]   = None
-    buyer:              Optional[str]   = None
-    seller:             Optional[str]   = None
-    policy_cohort:      Optional[str]   = None
-    hedge_program:      Optional[str]   = None
+    # Equity option
+    option_type:         Optional[str]   = None
+    option_style:        Optional[str]   = None
+    underlying:          Optional[str]   = None
+    strike:              Optional[float] = None
+    strike_high:         Optional[float] = None
+    num_options:         Optional[float] = None
+    premium:             Optional[float] = None
+    premium_per_option:  Optional[float] = None
+    expiry_date:         Optional[str]   = None
+    settlement_currency: Optional[str]   = None
+    settlement_method:   Optional[str]   = None
+    buyer:               Optional[str]   = None
+    seller:              Optional[str]   = None
+    # Fixed income
+    cusip:               Optional[str]   = None
+    isin:                Optional[str]   = None
+    direction:           Optional[str]   = None
+    par_value:           Optional[float] = None
+    price:               Optional[float] = None
+    yield_rate:          Optional[float] = None
+    coupon_rate:         Optional[float] = None
+    settlement_date:     Optional[str]   = None
+    accrued_interest:    Optional[float] = None
+    principal_amount:    Optional[float] = None
+    total_consideration: Optional[float] = None
+    # Cap/floor
+    structure_type:      Optional[str]   = None
+    cap_rate:            Optional[float] = None
+    floor_rate:          Optional[float] = None
+    termination_date:    Optional[str]   = None
+    payment_frequency:   Optional[str]   = None
+    day_count:           Optional[str]   = None
+    # TRS
+    ref_cusip:           Optional[str]   = None
+    ref_isin:            Optional[str]   = None
+    ref_issuer:          Optional[str]   = None
+    ref_coupon:          Optional[float] = None
+    ref_maturity:        Optional[str]   = None
+    initial_price:       Optional[float] = None
+    initial_spot_rate:   Optional[float] = None
+    local_notional:      Optional[float] = None
+    local_currency:      Optional[str]   = None
+    spread:              Optional[float] = None
+    leg_type:            Optional[str]   = None
+    valuation_frequency: Optional[str]   = None
+    # CDS
+    reference_entity:    Optional[str]   = None
+    protection_buyer:    Optional[str]   = None
+    protection_seller:   Optional[str]   = None
+    seniority:           Optional[str]   = None
+    ref_obligor:         Optional[str]   = None
+    credit_events:       Optional[list]  = None
+    payment_requirement: Optional[float] = None
+    default_requirement: Optional[float] = None
+    reference_price:     Optional[float] = None
+    # Insurance metadata
+    policy_cohort:       Optional[str]   = None
+    hedge_program:       Optional[str]   = None
 
 class ValidateOptions(BaseModel):
     severity_threshold:    Literal["low", "medium", "high"] = "low"
@@ -120,118 +185,95 @@ class ValidateResponse(BaseModel):
     metadata:              Optional[dict] = None
 
 class HealthResponse(BaseModel):
-    status:         str
-    version:        str
-    model:          str
-    llm_ready:      bool
-    asset_classes:  list[str]
+    status:        str
+    version:       str
+    model:         str
+    llm_ready:     bool
+    asset_classes: list[str]
 
 # ---------------------------------------------------------------------------
-# Normalization tables
+# Normalization
 # ---------------------------------------------------------------------------
-FLOAT_RATE_ALIASES = {
+FLOAT_ALIASES = {
     "usd-sofr": "SOFR", "sofr compound": "SOFR", "sofr-compound": "SOFR",
-    "sofr ois": "SOFR", "sofr avg": "SOFR", "sofr average": "SOFR", "us sofr": "SOFR",
+    "sofr ois": "SOFR", "us sofr": "SOFR",
     "usd-libor-bba": "LIBOR-3M", "usd-libor-bba-3m": "LIBOR-3M",
     "usd-libor-bba-6m": "LIBOR-6M", "usd-libor-bba-1m": "LIBOR-1M",
     "usd-libor-bba-12m": "LIBOR-12M", "usd-libor": "LIBOR-3M",
-    "libor": "LIBOR-3M", "libor-bba": "LIBOR-3M", "usd libor": "LIBOR-3M",
-    "eur-euribor-reuters": "EURIBOR-6M", "eur-euribor-telerate": "EURIBOR-6M",
-    "euribor": "EURIBOR-6M",
-    "gbp-sonia": "SONIA", "gbp sonia": "SONIA",
-    "eur-estr": "ESTR", "eur estr": "ESTR", "€str": "ESTR",
+    "libor": "LIBOR-3M", "libor-bba": "LIBOR-3M",
+    "eur-euribor-reuters": "EURIBOR-6M", "euribor": "EURIBOR-6M",
+    "gbp-sonia": "SONIA", "sonia": "SONIA",
+    "eur-estr": "ESTR", "estr": "ESTR",
+    "usd-federal funds-ois compound": "OIS", "ois": "OIS", "fed funds": "OIS",
 }
 
-def normalize_floating_rate(rate: Optional[str]) -> Optional[str]:
-    if not rate:
-        return rate
-    return FLOAT_RATE_ALIASES.get(rate.strip().lower(), rate)
+def norm_float(r): return FLOAT_ALIASES.get((r or "").strip().lower(), r) if r else r
 
 # ---------------------------------------------------------------------------
-# Extraction prompts
+# Extraction prompts — one per asset class
 # ---------------------------------------------------------------------------
-IRS_EXTRACTION_SYSTEM = """You are a capital markets confirmation parser.
-Extract structured fields from an IRS (Interest Rate Swap) confirmation document.
-Respond ONLY with a valid JSON object — no prose, no markdown fences.
+PROMPTS = {
+"IRS": """Extract IRS confirmation fields as JSON only. Fields:
+trade_id, trade_date(YYYY-MM-DD), effective_date, maturity_date, counterparty,
+notional(number), currency, fixed_rate(% e.g.4.125), floating_rate(normalized:SOFR/LIBOR-3M/etc),
+floating_spread, payment_frequency_fixed(Annual/Semi-Annual/Quarterly),
+payment_frequency_float, day_count_fixed(30/360|ACT/360|ACT/365),
+day_count_float, usi, extraction_confidence(0-1).
+Rules: fixed_rate as % not decimal. Dates YYYY-MM-DD. Normalize floating rate.
+Counterparty=the other party not the dealer. Amortizing: use initial notional.""",
 
-Extract these fields (use null if absent or ambiguous):
-{
-  "trade_id": string or null,
-  "trade_date": "YYYY-MM-DD" or null,
-  "effective_date": "YYYY-MM-DD" or null,
-  "maturity_date": "YYYY-MM-DD" or null,
-  "counterparty": string or null,
-  "notional": number or null,
-  "currency": "USD"|"EUR"|"GBP"|"JPY"|etc or null,
-  "fixed_rate": number (percentage, e.g. 4.125) or null,
-  "floating_rate": string or null,
-  "floating_spread": number or null,
-  "payment_frequency_fixed": "Annual"|"Semi-Annual"|"Quarterly" or null,
-  "payment_frequency_float": "Annual"|"Semi-Annual"|"Quarterly" or null,
-  "day_count_fixed": "30/360"|"ACT/360"|"ACT/365"|"ACT/ACT" or null,
-  "day_count_float": "30/360"|"ACT/360"|"ACT/365"|"ACT/ACT" or null,
-  "usi": string or null,
-  "extraction_confidence": number between 0 and 1
+"EQUITY_OPTION": """Extract equity option confirmation fields as JSON only. Fields:
+trade_id, trade_date(YYYY-MM-DD), counterparty, option_type(call/put),
+option_style(european/american), underlying(SPX/RTY/NDX/MSCI_EAFE/MSCI_EM/SX5E/NKY),
+strike(number), strike_high(for spreads), num_options, notional, currency,
+premium(total$), premium_per_option, premium_payment_date, expiry_date,
+settlement_currency, settlement_method(cash/physical), buyer, seller, extraction_confidence.
+Rules: normalize underlying. option_type lowercase. Party A=dealer=counterparty.""",
+
+"FIXED_INCOME": """Extract fixed income trade confirmation fields as JSON only. Fields:
+trade_id, trade_date(YYYY-MM-DD), cusip(uppercase no spaces), isin,
+issuer, security_desc, counterparty, direction(buy/sell), capacity(principal/agent),
+par_value, currency, price(per 100), yield_rate(%), coupon_rate(%),
+coupon_frequency(semi-annual/quarterly/monthly), maturity_date, settlement_date,
+accrued_interest($), principal_amount($), total_consideration($),
+day_count(30/360|ACT/ACT|ACT/365), callable(true/false), rating, extraction_confidence.
+Rules: CUSIP uppercase no spaces. direction lowercase. Dates YYYY-MM-DD.""",
+
+"CAP_FLOOR": """Extract interest rate cap/floor confirmation fields as JSON only. Fields:
+trade_id, trade_date(YYYY-MM-DD), structure_type(cap/floor/collar),
+counterparty, notional, currency, cap_rate(%), floor_rate(%),
+floating_rate(normalized), floating_tenor(3M/6M/1M), day_count(ACT/360|30/360),
+effective_date, termination_date, payment_frequency(Quarterly/Semi-Annual/Monthly),
+premium($), premium_date, buyer, seller, extraction_confidence.
+Rules: structure_type lowercase. Normalize floating rate. Dates YYYY-MM-DD.""",
+
+"TRS": """Extract total return swap confirmation fields as JSON only. Fields:
+trade_id, trade_date, counterparty, ref_cusip(uppercase), ref_isin(uppercase),
+ref_issuer, ref_security_type, ref_coupon(%), ref_maturity(YYYY-MM-DD),
+initial_price(per 100), seniority(senior/subordinated),
+notional(USD amount), local_notional, local_currency, initial_spot_rate,
+currency, direction(receiver/payer — total return perspective),
+leg_type(floating/fixed), floating_rate(normalized), spread(%),
+fixed_rate(%), day_count, payment_frequency, effective_date,
+termination_date, valuation_frequency(Monthly/Quarterly/Annual), extraction_confidence.
+Rules: ISIN/CUSIP uppercase. Normalize floating. Dates YYYY-MM-DD.
+direction=receiver means we receive total return. Party A=dealer=counterparty.""",
+
+"CDS": """Extract credit default swap confirmation fields as JSON only. Fields:
+trade_id, trade_date(YYYY-MM-DD), effective_date, termination_date,
+counterparty, reference_entity(exact legal name),
+protection_buyer(legal entity), protection_seller(legal entity),
+notional($), currency, fixed_rate(CDS spread % per annum, e.g.1.50 for 150bp),
+day_count(ACT/360|ACT/365), payment_frequency,
+seniority(senior/subordinated), ref_cusip(uppercase), ref_isin,
+ref_obligor, ref_coupon(%), ref_maturity(YYYY-MM-DD),
+credit_events(list: bankruptcy/failure to pay/obligation default/
+obligation acceleration/repudiation_moratorium/restructuring/governmental intervention),
+payment_requirement($), default_requirement($),
+settlement_method(auction/physical/cash), extraction_confidence.
+Rules: fixed_rate as % (1.50 not 0.015). Party A=dealer=counterparty.
+Reference entity = exact legal name. credit_events as lowercase list.""",
 }
-Rules:
-- fixed_rate as percentage (4.125 not 0.04125). "2.01000 percent" → 2.01.
-- Dates always YYYY-MM-DD.
-- floating_rate normalized: USD-SOFR/SOFR Compound → "SOFR"; USD-LIBOR-BBA → "LIBOR-3M"; EURIBOR → "EURIBOR-6M"; GBP-SONIA → "SONIA"; EUR-ESTR → "ESTR".
-- counterparty: exact legal entity name as written. Not the dealer — the other party.
-- Amortizing notional schedules: extract the INITIAL (first effective date) notional.
-- Cross-currency swaps: extract the USD notional.
-- Internal fields (book, account, status) never appear in counterparty confirmations.
-"""
-
-EQ_EXTRACTION_SYSTEM = """You are a capital markets confirmation parser specializing in OTC equity derivatives.
-Extract structured fields from an equity index option confirmation document.
-Respond ONLY with a valid JSON object — no prose, no markdown fences.
-
-Extract these fields (use null if absent or ambiguous):
-{
-  "trade_id": string or null,
-  "trade_date": "YYYY-MM-DD" or null,
-  "counterparty": string or null,
-  "option_type": "call" or "put" or null,
-  "option_style": "european" or "american" or null,
-  "underlying": string (normalized index code) or null,
-  "strike": number (index level, e.g. 5200.00) or null,
-  "strike_high": number (upper strike for spreads) or null,
-  "num_options": number or null,
-  "notional": number or null,
-  "currency": "USD"|"EUR"|"GBP" or null,
-  "premium": number (total premium in currency) or null,
-  "premium_per_option": number or null,
-  "premium_payment_date": "YYYY-MM-DD" or null,
-  "expiry_date": "YYYY-MM-DD" or null,
-  "settlement_currency": "USD"|"EUR"|"GBP" or null,
-  "settlement_method": "cash" or "physical" or null,
-  "buyer": string (legal entity name) or null,
-  "seller": string (legal entity name) or null,
-  "extraction_confidence": number between 0 and 1
-}
-Rules:
-- Dates always YYYY-MM-DD.
-- underlying: normalize to canonical code:
-    "S&P 500 Index", "S&P500", "SPX Index" → "SPX"
-    "Russell 2000", "Russell 2000 Index" → "RTY"
-    "Nasdaq-100", "NASDAQ 100" → "NDX"
-    "MSCI EAFE", "MXEA" → "MSCI_EAFE"
-    "MSCI EM", "MSCI Emerging Markets" → "MSCI_EM"
-    "Euro Stoxx 50", "SX5E" → "SX5E"
-    "Nikkei 225" → "NKY"
-- option_type: always lowercase "call" or "put".
-- option_style: always lowercase "european" or "american".
-- For call spreads: strike = lower strike, strike_high = upper strike (cap level).
-- counterparty: extract Party A (the dealer/bank) as the counterparty field.
-  In equity option confirmations, Party A is always the dealer. Party B is the
-  buy-side client (insurance company, asset manager). From the buy-side perspective,
-  the dealer is their counterparty — matching how their OMS books the trade.
-  Example: "Party A: Standard Chartered Bank" → counterparty = "Standard Chartered Bank".
-- premium: total dollar amount of the option premium, not per-option.
-- settlement_method: "cash" for cash-settled index options.
-- Internal fields (book, account, hedge program) never appear in dealer confirmations.
-"""
 
 # ---------------------------------------------------------------------------
 # Salvage JSON parser
@@ -261,24 +303,25 @@ def _salvage_json(raw: str) -> dict:
         return {}
 
 # ---------------------------------------------------------------------------
-# Extraction dispatcher
+# Extraction
 # ---------------------------------------------------------------------------
-def extract_fields(confirmation_text: str, asset_class: str) -> tuple[dict, float]:
+def extract_fields(text: str, asset_class: str) -> tuple[dict, float]:
     if not client:
         raise HTTPException(status_code=503, detail="LLM client not configured")
-    system = EQ_EXTRACTION_SYSTEM if asset_class == "EQUITY_OPTION" else IRS_EXTRACTION_SYSTEM
-    asset_label = "equity option" if asset_class == "EQUITY_OPTION" else "IRS"
+    prompt = PROMPTS.get(asset_class, PROMPTS["IRS"])
     try:
         msg = client.messages.create(
-            model=MODEL, max_tokens=1024, system=system,
-            messages=[{"role": "user", "content": f"Parse this {asset_label} confirmation:\n\n{confirmation_text}"}],
+            model=MODEL, max_tokens=1024, system=prompt,
+            messages=[{"role": "user", "content": f"Parse this {asset_class} confirmation:\n\n{text}"}],
         )
         raw = re.sub(r"^```json\s*", "", msg.content[0].text.strip())
         raw = re.sub(r"\s*```$", "", raw)
         extracted = _salvage_json(raw)
         confidence = float(extracted.pop("extraction_confidence", 0.85))
-        if asset_class == "IRS" and "floating_rate" in extracted:
-            extracted["floating_rate"] = normalize_floating_rate(extracted["floating_rate"])
+        # Post-extraction normalization
+        for fld in ("floating_rate", "spread"):
+            if fld in extracted and asset_class in ("IRS", "CAP_FLOOR", "TRS"):
+                extracted[fld] = norm_float(extracted.get(fld))
         if asset_class == "EQUITY_OPTION" and "underlying" in extracted:
             extracted["underlying"] = normalize_index(extracted["underlying"])
         return extracted, confidence
@@ -295,7 +338,7 @@ async def health():
     return HealthResponse(
         status="ok", version=API_VERSION, model=MODEL,
         llm_ready=client is not None,
-        asset_classes=["IRS", "EQUITY_OPTION"],
+        asset_classes=ASSET_CLASSES,
     )
 
 @app.post(
@@ -310,12 +353,9 @@ async def validate_confirmation(req: ValidateRequest):
     asset_class = req.expected_economics.asset_class
 
     extracted, confidence = extract_fields(req.confirmation_text, asset_class)
-
     internal_dict = req.expected_economics.model_dump(exclude_none=True)
-    if asset_class == "EQUITY_OPTION":
-        result = eq_engine.reconcile(extracted, internal_dict, case_id=match_id)
-    else:
-        result = irs_engine.reconcile(extracted, internal_dict, case_id=match_id)
+    engine = ENGINES[asset_class]
+    result = engine.reconcile(extracted, internal_dict, case_id=match_id)
 
     threshold_rank = {"low": 0, "medium": 1, "high": 2}
     threshold = req.options.severity_threshold
