@@ -167,16 +167,29 @@ class TRSConfirmation:
         ]
         obj = cls(**{f: d[f] for f in fields if f in d})
         if obj.floating_rate:
-            obj.floating_rate = normalize_float(obj.floating_rate)
+            obj.floating_rate = normalize_float(str(obj.floating_rate))
         if obj.direction:
-            obj.direction = obj.direction.strip().lower()
+            obj.direction = str(obj.direction).strip().lower()
         if obj.leg_type:
-            obj.leg_type = obj.leg_type.strip().lower()
-        # Normalize identifiers
+            obj.leg_type = str(obj.leg_type).strip().lower()
+        if obj.seniority:
+            obj.seniority = str(obj.seniority).strip().lower()
         if obj.ref_cusip:
-            obj.ref_cusip = obj.ref_cusip.strip().upper().replace(" ", "")
+            obj.ref_cusip = str(obj.ref_cusip).strip().upper().replace(" ", "")
         if obj.ref_isin:
-            obj.ref_isin = obj.ref_isin.strip().upper().replace(" ", "")
+            obj.ref_isin = str(obj.ref_isin).strip().upper().replace(" ", "")
+        if obj.ref_issuer:
+            obj.ref_issuer = str(obj.ref_issuer)
+        if obj.counterparty:
+            obj.counterparty = str(obj.counterparty)
+        if obj.currency:
+            obj.currency = str(obj.currency).strip().upper()
+        if obj.local_currency:
+            obj.local_currency = str(obj.local_currency).strip().upper()
+        if obj.day_count:
+            obj.day_count = str(obj.day_count)
+        if obj.valuation_frequency:
+            obj.valuation_frequency = str(obj.valuation_frequency)
         return obj
 
 
