@@ -207,7 +207,13 @@ FLOAT_ALIASES = {
     "usd-federal funds-ois compound": "OIS", "ois": "OIS", "fed funds": "OIS",
 }
 
-def norm_float(r): return FLOAT_ALIASES.get((r or "").strip().lower(), r) if r else r
+def norm_float(r):
+    if not r:
+        return r
+    try:
+        return FLOAT_ALIASES.get(str(r).strip().lower(), str(r) if not isinstance(r, str) else r)
+    except Exception:
+        return r
 
 # ---------------------------------------------------------------------------
 # Extraction prompts — one per asset class
@@ -341,9 +347,11 @@ def extract_fields(text: str, asset_class: str) -> tuple[dict, float]:
         for k in list(extracted.keys()):
             if k in STRING_FIELDS and extracted[k] is not None and not isinstance(extracted[k], str):
                 extracted[k] = str(extracted[k])
-        for fld in ("floating_rate", "spread"):
+        for fld in ("floating_rate",):
             if fld in extracted and asset_class in ("IRS", "CAP_FLOOR", "TRS"):
-                extracted[fld] = norm_float(extracted.get(fld))
+                val = extracted.get(fld)
+                if val is not None:
+                    extracted[fld] = norm_float(val)
         if asset_class == "EQUITY_OPTION" and "underlying" in extracted:
             extracted["underlying"] = normalize_index(extracted["underlying"])
         return extracted, confidence
