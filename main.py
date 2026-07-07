@@ -322,7 +322,25 @@ def extract_fields(text: str, asset_class: str) -> tuple[dict, float]:
         except (ValueError, TypeError):
             extracted.pop("extraction_confidence", None)
             confidence = 0.85
-        # Post-extraction normalization
+        # Sanitize: coerce any non-string values in known string fields to str
+        # Prevents 'float object has no attribute strip' in reconciler from_dict methods
+        STRING_FIELDS = {
+            "counterparty", "trade_date", "effective_date", "maturity_date",
+            "termination_date", "settlement_date", "expiry_date", "ref_maturity",
+            "floating_rate", "currency", "settlement_currency", "local_currency",
+            "direction", "option_type", "option_style", "underlying", "structure_type",
+            "leg_type", "day_count", "day_count_fixed", "day_count_float",
+            "payment_frequency", "payment_frequency_fixed", "payment_frequency_float",
+            "valuation_frequency", "ref_cusip", "ref_isin", "ref_issuer",
+            "ref_security_type", "seniority", "settlement_method", "usi",
+            "reference_entity", "protection_buyer", "protection_seller",
+            "ref_obligor", "cusip", "isin", "issuer", "security_desc",
+            "capacity", "coupon_frequency", "rating", "buyer", "seller",
+            "premium_payment_date", "policy_cohort", "hedge_program",
+        }
+        for k in list(extracted.keys()):
+            if k in STRING_FIELDS and extracted[k] is not None and not isinstance(extracted[k], str):
+                extracted[k] = str(extracted[k])
         for fld in ("floating_rate", "spread"):
             if fld in extracted and asset_class in ("IRS", "CAP_FLOOR", "TRS"):
                 extracted[fld] = norm_float(extracted.get(fld))
