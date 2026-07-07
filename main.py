@@ -377,7 +377,10 @@ async def validate_confirmation(req: ValidateRequest):
     extracted, confidence = extract_fields(req.confirmation_text, asset_class)
     internal_dict = req.expected_economics.model_dump(exclude_none=True)
     engine = ENGINES[asset_class]
-    result = engine.reconcile(extracted, internal_dict, case_id=match_id)
+    try:
+        result = engine.reconcile(extracted, internal_dict, case_id=match_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM extraction failed: {e} | extracted={extracted}")
 
     threshold_rank = {"low": 0, "medium": 1, "high": 2}
     threshold = req.options.severity_threshold
