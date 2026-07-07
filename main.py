@@ -317,7 +317,11 @@ def extract_fields(text: str, asset_class: str) -> tuple[dict, float]:
         raw = re.sub(r"^```json\s*", "", msg.content[0].text.strip())
         raw = re.sub(r"\s*```$", "", raw)
         extracted = _salvage_json(raw)
-        confidence = float(extracted.pop("extraction_confidence", 0.85))
+        try:
+            confidence = float(extracted.pop("extraction_confidence", 0.85))
+        except (ValueError, TypeError):
+            extracted.pop("extraction_confidence", None)
+            confidence = 0.85
         # Post-extraction normalization
         for fld in ("floating_rate", "spread"):
             if fld in extracted and asset_class in ("IRS", "CAP_FLOOR", "TRS"):
