@@ -19,7 +19,7 @@ args = ap.parse_args()
 if not args.live:
     import os; os.environ["ANTHROPIC_API_KEY"] = ""
 
-from main import app, reconciler, ValidateRequest, ExpectedEconomics, ValidateOptions
+from main import app, ValidateRequest, ExpectedEconomics, ValidateOptions
 from fastapi.testclient import TestClient
 
 client = TestClient(app)
@@ -128,7 +128,7 @@ if not args.live:
     # Monkey-patch extract_fields to return mock data
     import main as _main
     _mock_idx = [0]
-    def _mock_extract(text):
+    async def _mock_extract(text, asset_class="IRS"):
         idx = _mock_idx[0]; _mock_idx[0] += 1
         return MOCK_EXTRACTIONS[idx], 0.99
     _main.extract_fields = _mock_extract

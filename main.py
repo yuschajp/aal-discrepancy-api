@@ -18,7 +18,7 @@ Architecture (Decision Log 2026-07-04/05):
     → Response
 """
 
-import os, uuid, time, json, re
+import os, uuid, time, json, re, asyncio, random, logging
 from typing import Optional, Literal
 from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.security.api_key import APIKeyHeader
@@ -38,7 +38,14 @@ AAL_API_KEY       = os.environ.get("AAL_API_KEY", "dev-key-replace-in-prod")
 MODEL             = "claude-haiku-4-5-20251001"
 API_VERSION       = "aal-disc-v3.0"
 
-client     = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+AAL_LLM_MAX_ATTEMPTS         = int(os.environ.get("AAL_LLM_MAX_ATTEMPTS", "4"))          # 1 initial + 3 retries
+AAL_LLM_BACKOFF_BASE_S       = float(os.environ.get("AAL_LLM_BACKOFF_BASE_S", "0.5"))
+AAL_LLM_BACKOFF_MULTIPLIER   = float(os.environ.get("AAL_LLM_BACKOFF_MULTIPLIER", "2.0"))
+AAL_LLM_BACKOFF_MAX_S        = float(os.environ.get("AAL_LLM_BACKOFF_MAX_S", "20.0"))
+AAL_LLM_RETRY_AFTER_JITTER_S = float(os.environ.get("AAL_LLM_RETRY_AFTER_JITTER_S", "1.0"))
+AAL_LLM_TIMEOUT_S            = float(os.environ.get("AAL_LLM_TIMEOUT_S", "30.0"))
+
+client     = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, max_retries=0, timeout=AAL_LLM_TIMEOUT_S) if ANTHROPIC_API_KEY else None
 ENGINES    = {
     "IRS":           IRSReconciler(),
     "EQUITY_OPTION": EquityOptionReconciler(),
@@ -311,12 +318,53 @@ def _salvage_json(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 # Extraction
 # ---------------------------------------------------------------------------
-def extract_fields(text: str, asset_class: str) -> tuple[dict, float]:
+log = logging.getLogger("aal.extract")
+
+RETRYABLE_LLM_EXC = (
+    anthropic.APIConnectionError,   # network failure; APITimeoutError is a subclass
+    anthropic.RateLimitError,       # HTTP 429
+    anthropic.InternalServerError,  # HTTP >=500, incl. 529 overloaded_error
+)
+
+def _retry_after_seconds(exc) -> float | None:
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    raw = resp.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return float(raw)  # numeric-seconds form; HTTP-date form falls back to backoff
+    except ValueError:
+        return None
+
+async def _messages_create_with_retry(**kwargs):
+    last_exc = None
+    for attempt in range(AAL_LLM_MAX_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(client.messages.create, **kwargs)
+        except RETRYABLE_LLM_EXC as e:
+            last_exc = e
+            if attempt == AAL_LLM_MAX_ATTEMPTS - 1:
+                break
+            ra = _retry_after_seconds(e)
+            if ra is not None:  # honor server directive + small spread
+                delay = min(ra, AAL_LLM_BACKOFF_MAX_S) + random.uniform(0, AAL_LLM_RETRY_AFTER_JITTER_S)
+            else:               # exponential backoff with full jitter
+                cap = min(AAL_LLM_BACKOFF_MAX_S,
+                          AAL_LLM_BACKOFF_BASE_S * (AAL_LLM_BACKOFF_MULTIPLIER ** attempt))
+                delay = random.uniform(0, cap)
+            log.warning("LLM retry %d/%d in %.2fs after %s: %s",
+                        attempt + 1, AAL_LLM_MAX_ATTEMPTS - 1, delay, type(e).__name__, e)
+            await asyncio.sleep(delay)
+    raise last_exc
+
+async def extract_fields(text: str, asset_class: str) -> tuple[dict, float]:
     if not client:
         raise HTTPException(status_code=503, detail="LLM client not configured")
     prompt = PROMPTS.get(asset_class, PROMPTS["IRS"])
     try:
-        msg = client.messages.create(
+        msg = await _messages_create_with_retry(
             model=MODEL, max_tokens=1024, system=prompt,
             messages=[{"role": "user", "content": f"Parse this {asset_class} confirmation:\n\n{text}"}],
         )
@@ -357,8 +405,11 @@ def extract_fields(text: str, asset_class: str) -> tuple[dict, float]:
         return extracted, confidence
     except HTTPException:
         raise
+    except RETRYABLE_LLM_EXC as e:
+        raise HTTPException(status_code=502,
+            detail=f"LLM extraction failed after {AAL_LLM_MAX_ATTEMPTS} attempts: {type(e).__name__}: {e}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM extraction failed: {e}")
+        raise HTTPException(status_code=502, detail=f"LLM extraction failed: {type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -382,7 +433,7 @@ async def validate_confirmation(req: ValidateRequest):
     match_id = str(uuid.uuid4())
     asset_class = req.expected_economics.asset_class
 
-    extracted, confidence = extract_fields(req.confirmation_text, asset_class)
+    extracted, confidence = await extract_fields(req.confirmation_text, asset_class)
     internal_dict = req.expected_economics.model_dump(exclude_none=True)
     engine = ENGINES[asset_class]
     try:
@@ -431,3 +482,518 @@ async def validate_confirmation(req: ValidateRequest):
         raw_extraction=extracted if req.options.return_raw_extraction else None,
         metadata=metadata,
     )
+
+# ---------------------------------------------------------------------------
+# v3.1 — Raw ingestion endpoint (MarkitWire FIXML or PDF text)
+# ---------------------------------------------------------------------------
+from fixml_parser import parse_fixml
+
+class ValidateRawRequest(BaseModel):
+    source_type:   Literal["markitwire", "pdf_text"] = "markitwire"
+    source_data:   str = Field(..., description="Raw FIXML string or extracted PDF text")
+    internal_type: Literal["markitwire", "pdf_text", "json"] = "json"
+    internal_data: str = Field(..., description="Internal record as FIXML, PDF text, or JSON string")
+    options:       ValidateOptions = ValidateOptions()
+
+@app.post(
+    "/v1/confirmations/validate-raw",
+    response_model=ValidateResponse,
+    tags=["Confirmations"],
+    dependencies=[Depends(require_api_key)],
+)
+async def validate_raw(req: ValidateRawRequest):
+    """
+    Accept raw MarkitWire FIXML or PDF text for both counterparty confirmation
+    and internal record. Parses both sides, routes to the correct engine.
+
+    source_type / internal_type:
+      markitwire  — raw FIXML string (deterministic parse, no LLM)
+      pdf_text    — raw text extracted from a PDF confirmation (LLM extraction)
+      json        — pre-structured JSON matching ExpectedEconomics fields
+    """
+    t0 = time.time()
+    match_id = str(uuid.uuid4())
+
+    # --- Parse counterparty side ---
+    if req.source_type == "markitwire":
+        try:
+            cpty_dict = parse_fixml(req.source_data)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"FIXML parse error: {e}")
+        asset_class = cpty_dict.pop("asset_class")
+        extracted   = cpty_dict
+        confidence  = 1.0  # deterministic parse
+    elif req.source_type == "pdf_text":
+        # Detect asset class via LLM first, then extract
+        asset_class = "IRS"  # default; TODO: add asset class detection step
+        extracted, confidence = await extract_fields(req.source_data, asset_class)
+    else:
+        raise HTTPException(status_code=422, detail="Unsupported source_type")
+
+    # --- Parse internal side ---
+    if req.internal_type == "json":
+        try:
+            internal_dict = json.loads(req.internal_data)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=422, detail=f"Internal JSON parse error: {e}")
+    elif req.internal_type == "markitwire":
+        try:
+            internal_dict = parse_fixml(req.internal_data)
+            internal_dict.pop("asset_class", None)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"Internal FIXML parse error: {e}")
+    elif req.internal_type == "pdf_text":
+        internal_dict, _ = await extract_fields(req.internal_data, asset_class)
+    else:
+        raise HTTPException(status_code=422, detail="Unsupported internal_type")
+
+    # --- Reconcile ---
+    engine = ENGINES.get(asset_class)
+    if not engine:
+        raise HTTPException(status_code=422, detail=f"Unsupported asset class: {asset_class}")
+
+    try:
+        result = engine.reconcile(extracted, internal_dict, case_id=match_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Reconciliation failed: {e}")
+
+    threshold_rank = {"low": 0, "medium": 1, "high": 2}
+    threshold = req.options.severity_threshold
+    discrepancies = []
+    for d in [result.primary, result.secondary]:
+        if d is None:
+            continue
+        if threshold_rank.get(d.severity, 0) >= threshold_rank.get(threshold, 0):
+            discrepancies.append(DiscrepancyDetail(
+                field=d.field, category=d.category,
+                expected=d.internal_value, extracted=d.counterparty_value,
+                difference=d.difference, severity=d.severity,
+                exposure_estimate_usd=d.exposure_usd, confidence=d.confidence,
+            ))
+
+    overall_status = (
+        "clean" if not result.exception_exists else
+        "discrepant" if result.overall_severity == "high" else
+        "review_required"
+    )
+
+    return ValidateResponse(
+        match_id=match_id,
+        asset_class=asset_class,
+        overall_status=overall_status,
+        discrepancies=discrepancies,
+        overall_severity=result.overall_severity,
+        escalation_required=result.escalation_required,
+        recommended_action=result.recommended_action,
+        extraction_confidence=confidence,
+        processing_ms=int((time.time() - t0) * 1000),
+        model_version=API_VERSION,
+        raw_extraction=extracted if req.options.return_raw_extraction else None,
+        metadata=None,
+    )
+
+# ---------------------------------------------------------------------------
+# v3.1 — Batch endpoint
+# ---------------------------------------------------------------------------
+import asyncio
+from typing import List
+
+class BatchItem(BaseModel):
+    source_type:   Literal["markitwire", "pdf_text"] = "markitwire"
+    source_data:   str
+    internal_type: Literal["markitwire", "pdf_text", "json"] = "json"
+    internal_data: str
+
+class BatchRequest(BaseModel):
+    items:           List[BatchItem] = Field(..., max_length=500)
+    options:         ValidateOptions = ValidateOptions()
+    max_concurrent:  int = Field(default=10, ge=1, le=50)
+
+class BatchSummary(BaseModel):
+    batch_id:      str
+    total:         int
+    clean:         int
+    discrepant:    int
+    review_required: int
+    errors:        int
+    processing_ms: int
+    results:       list[ValidateResponse]
+
+async def _process_one(item: BatchItem, options: ValidateOptions) -> ValidateResponse:
+    req = ValidateRawRequest(
+        source_type=item.source_type,
+        source_data=item.source_data,
+        internal_type=item.internal_type,
+        internal_data=item.internal_data,
+        options=options,
+    )
+    return await validate_raw(req)
+
+@app.post(
+    "/v1/confirmations/batch",
+    response_model=BatchSummary,
+    tags=["Confirmations"],
+    dependencies=[Depends(require_api_key)],
+)
+async def validate_batch(req: BatchRequest):
+    """
+    Process up to 500 reconciliations in a single call.
+    Items run concurrently (default 10 at a time).
+    Returns all results plus a summary breakdown.
+    """
+    t0 = time.time()
+    batch_id = str(uuid.uuid4())
+    semaphore = asyncio.Semaphore(req.max_concurrent)
+
+    async def _guarded(item: BatchItem) -> ValidateResponse | dict:
+        async with semaphore:
+            try:
+                return await _process_one(item, req.options)
+            except HTTPException as e:
+                return {"error": e.detail}
+            except Exception as e:
+                return {"error": str(e)}
+
+    results_raw = await asyncio.gather(*[_guarded(item) for item in req.items])
+
+    results   = [r for r in results_raw if isinstance(r, dict) and "match_id" in r or isinstance(r, ValidateResponse)]
+    errors    = [r for r in results_raw if isinstance(r, dict) and "error" in r]
+    valid     = [r for r in results_raw if isinstance(r, ValidateResponse)]
+
+    clean           = sum(1 for r in valid if r.overall_status == "clean")
+    discrepant      = sum(1 for r in valid if r.overall_status == "discrepant")
+    review_required = sum(1 for r in valid if r.overall_status == "review_required")
+
+    return BatchSummary(
+        batch_id=batch_id,
+        total=len(req.items),
+        clean=clean,
+        discrepant=discrepant,
+        review_required=review_required,
+        errors=len(errors),
+        processing_ms=int((time.time() - t0) * 1000),
+        results=valid,
+    )
+
+# ---------------------------------------------------------------------------
+# v3.2 — Margin Call Dispute Analysis endpoint
+# ---------------------------------------------------------------------------
+
+DISPUTE_SYSTEM = """You are an expert capital markets collateral operations analyst specializing in margin call dispute classification.
+
+You will be given a margin call case containing:
+- A margin call notice from a counterparty
+- The firm's internal calculation
+- Context including CSA terms and portfolio summary
+
+Your job is CLASSIFICATION and EXTRACTION ONLY. You do NOT calculate, sum, subtract, net, or reconcile any dollar amounts. The system computes every numeric amount deterministically from the two structured inputs. You only identify the dispute category, the field in dispute, and (where noted) extract a rate that is explicitly stated in the CSA text.
+
+DISPUTE CATEGORIES (use exactly these codes):
+- DIS-PRICE: MTM/portfolio valuation difference between parties
+- DIS-QTY: Quantity, contract count, or notional disagrees between parties
+- DIS-HAIRCUT: Collateral IS eligible under the CSA but the wrong haircut percentage was applied. Do NOT use for ineligible collateral - use DIS-ELGBLTY.
+- DIS-ELGBLTY: The collateral posted is ineligible under the CSA (wrong asset type, rating, or currency). Do NOT use when eligible collateral has a wrong haircut - use DIS-HAIRCUT.
+- DIS-FX: FX rate used for currency conversion or collateral valuation differs from the CSA-specified source
+- DIS-THRESH: Threshold or MTA not correctly applied (call below MTA, threshold not deducted, overcollateralization after threshold)
+- DIS-TIMING: Settlement date or calculation date error
+- DIS-NETTING: Netting set constructed incorrectly - wrong trades included/excluded, or collateral misallocated between CSAs
+- DIS-CPTY: Counterparty identity or legal entity mismatch
+- DIS-CSA: CSA term disagreement (rounding convention, MTA amendment, collateral currency, call currency, margin ratio)
+- DIS-CALC: Calculation error not attributable to another category
+- DIS-SIMM: ISDA SIMM methodology dispute - different inputs, versions, or risk factor sensitivities
+- DIS-STALE: Stale or unavailable pricing used by one party
+- DIS-DUPE: Duplicate margin call - same calculation date, amount, and value date as a prior affirmed call
+- DIS-SETTLED: Collateral transfer not yet reflected in counterparty records
+- DIS-DIR: Call direction is wrong - counterparty calling for payment in the wrong direction
+- DIS-CLEAN: No dispute exists; the call is correct
+
+CLASSIFICATION RULES (these decide the CODE, never a number):
+1. DIS-HAIRCUT vs DIS-ELGBLTY: eligible collateral + wrong haircut rate -> DIS-HAIRCUT. Ineligible collateral type -> DIS-ELGBLTY.
+2. DIS-NETTING vs DIS-ELGBLTY: eligible collateral in the wrong netting set -> DIS-NETTING. Ineligible collateral -> DIS-ELGBLTY.
+3. If the two parties report the same amount from different sources, that is NOT a dispute -> DIS-CLEAN.
+4. A collateral or valuation difference below the MTA is NOT a dispute -> DIS-CLEAN.
+5. For DIS-THRESH: if the entire call is invalid (below MTA, or threshold makes the correct call zero), set "field" to "call_amount". Otherwise set "field" to the specific threshold/mta field.
+
+FIELD: name the single structured input field most in dispute (e.g. "portfolio_mtm", "collateral_on_hand", "simm_amount", "fx_rate_used", "netting_set", "collateral_type", "call_direction", "call_id", "threshold", "contracts"). Use the exact key name from the inputs when one exists.
+
+EXTRACTION (only when category is DIS-HAIRCUT):
+- Read the CSA-required haircut for the disputed collateral directly from the CSA terms / notes text and report it as a decimal in "csa_haircut_rate" (e.g. 2% -> 0.02). If the CSA text does not state a rate, use null. Do NOT compute anything - only copy the stated rate.
+
+ESCALATION TARGET: name the human/desk to escalate to in plain English, or null. This is a judgment, not a number.
+
+Respond with THIS EXACT JSON and nothing else:
+{
+  "dispute_exists": true or false,
+  "primary": {"category": "DIS-CODE", "field": "field_name"} or null,
+  "secondary": {"category": "DIS-CODE", "field": "field_name"} or null,
+  "csa_haircut_rate": <decimal or null>,
+  "escalation_target": "<who, or null>"
+}
+If there is no dispute: dispute_exists=false, primary=null, secondary=null, csa_haircut_rate=null, escalation_target=null."""
+
+
+class MarginCallNotice(BaseModel):
+    model_config = {"extra": "allow"}
+    call_id:          Optional[str]   = None
+    call_date:        Optional[str]   = None
+    value_date:       Optional[str]   = None
+    counterparty:     Optional[str]   = None
+    call_direction:   Optional[str]   = None
+    call_currency:    Optional[str]   = None
+    call_amount:      Optional[float] = None
+    calculation_date: Optional[str]   = None
+    portfolio_mtm:    Optional[float] = None
+    threshold:        Optional[float] = None
+    mta:              Optional[float] = None
+    rounding:         Optional[float] = None
+    collateral_on_hand: Optional[float] = None
+    pricing_source:   Optional[str]   = None
+
+class InternalCalculation(BaseModel):
+    model_config = {"extra": "allow"}
+    call_date:          Optional[str]   = None
+    value_date:         Optional[str]   = None
+    counterparty:       Optional[str]   = None
+    call_direction:     Optional[str]   = None
+    call_currency:      Optional[str]   = None
+    calculated_amount:  Optional[float] = None
+    calculation_date:   Optional[str]   = None
+    portfolio_mtm:      Optional[float] = None
+    threshold:          Optional[float] = None
+    mta:                Optional[float] = None
+    rounding:           Optional[float] = None
+    collateral_on_hand: Optional[float] = None
+    pricing_source:     Optional[str]   = None
+
+class DisputeContext(BaseModel):
+    csa_terms:         Optional[str] = None
+    portfolio_summary: Optional[str] = None
+
+class DisputeRequest(BaseModel):
+    margin_call_notice:  MarginCallNotice
+    internal_calculation: InternalCalculation
+    context:             DisputeContext = DisputeContext()
+    case_id:             Optional[str] = None
+
+class DisputeDetail(BaseModel):
+    category:            Optional[str]   = None
+    field:               Optional[str]   = None
+    counterparty_value:  Optional[float] = None
+    internal_value:      Optional[float] = None
+    difference:          Optional[float] = None
+    disputed_call_amount: Optional[float] = None
+    correct_call_amount: Optional[float] = None
+
+class DisputeResponse(BaseModel):
+    case_id:             Optional[str]
+    dispute_exists:      bool
+    primary_dispute:     Optional[DisputeDetail]
+    secondary_dispute:   Optional[DisputeDetail]
+    recommended_action:  str
+    escalation_required: bool
+    escalation_target:   Optional[str]
+    pay_undisputed:      bool
+    undisputed_amount:   Optional[float]
+    extraction_confidence: float
+    processing_ms:       int
+    model_version:       str
+
+
+# --- deterministic dispute arithmetic (no LLM numbers past this point) -------
+_NO_PAY_CATEGORIES = {"DIS-DUPE", "DIS-DIR", "DIS-ELGBLTY"}
+
+def _num(v) -> Optional[float]:
+    return float(v) if isinstance(v, (int, float)) else None
+
+def _round_to(x: float, inc: Optional[float]) -> float:
+    if not inc:
+        return x
+    return round(x / inc) * inc
+
+def _money(x: Optional[float]) -> str:
+    return f"${x:,.0f}" if x is not None else "$0"
+
+def _correct_call_amount(category, field, notice, internal, haircut_rate) -> Optional[float]:
+    calc = _num(internal.calculated_amount)
+    call = _num(notice.call_amount)
+    coll = _num(notice.collateral_on_hand)
+    if category == "DIS-DUPE":
+        return 0.0
+    if category == "DIS-DIR":
+        return None if calc is None else -calc
+    if category == "DIS-FX":
+        return call                                  # counterparty rate governs
+    if category == "DIS-ELGBLTY":
+        return (call + coll) if (call is not None and coll is not None) else calc
+    if category == "DIS-THRESH":
+        return 0.0 if field == "call_amount" else calc
+    if category == "DIS-HAIRCUT":
+        rate = _num(haircut_rate)
+        if rate is not None and call is not None and coll is not None:
+            inc = _num(notice.rounding) or _num(internal.rounding) or 0
+            return _round_to(call + coll * rate, inc)
+        return calc                                  # fallback: no rate extractable
+    return calc                                      # PRICE/QTY/SETTLED/SIMM/STALE/NETTING/CSA/TIMING/CALC/CPTY
+
+def _disputed_call_amount(category, correct, notice, internal) -> Optional[float]:
+    call = _num(notice.call_amount)
+    calc = _num(internal.calculated_amount)
+    if call is None:
+        return None
+    if category in ("DIS-DUPE", "DIS-DIR"):
+        return call
+    if category == "DIS-FX":
+        return None if calc is None else call - calc
+    if category == "DIS-QTY":
+        return None if correct is None else abs(call - correct)
+    if correct is None:
+        return None
+    return call - correct                            # signed: negative for HAIRCUT/ELGBLTY under-calls
+
+def _undisputed_amount(pay, correct, notice) -> Optional[float]:
+    if not pay:
+        return 0.0
+    call = _num(notice.call_amount)
+    c = max(0.0, correct) if correct is not None else None
+    if call is None:
+        return c
+    if c is None:
+        return call
+    return min(call, c)                              # pay the lesser of demanded vs owed
+
+def _pay_undisputed(category, correct, dispute_exists) -> bool:
+    if not dispute_exists:
+        return True
+    if category in _NO_PAY_CATEGORIES:
+        return False
+    if correct is not None and abs(correct) < 0.5:   # nothing left to pay
+        return False
+    return True
+
+def _escalation_required(category, correct, dispute_exists) -> bool:
+    if not dispute_exists:
+        return False
+    if category == "DIS-THRESH" and correct is not None and abs(correct) < 0.5:
+        return False
+    if category == "DIS-TIMING":
+        return False
+    return True
+
+def _lookup(field, model) -> Optional[float]:
+    if not field:
+        return None
+    return _num(model.model_dump(exclude_none=True).get(field))
+
+def _detail(category, field, notice, internal, correct, disputed) -> DisputeDetail:
+    cv = _lookup(field, notice)
+    iv = _lookup(field, internal)
+    diff = abs(cv - iv) if (cv is not None and iv is not None) else None
+    return DisputeDetail(
+        category=category, field=field,
+        counterparty_value=cv, internal_value=iv, difference=diff,
+        disputed_call_amount=disputed, correct_call_amount=correct,
+    )
+
+def _recommended_action(dispute_exists, category, pay, disputed, undisputed,
+                        call, escalation_target) -> str:
+    if not dispute_exists:
+        return f"Call is correct. Pay {_money(call)} by value date."
+    parts = [f"Dispute {_money(abs(disputed) if disputed is not None else None)} ({category})."]
+    if pay:
+        parts.append(f"Pay undisputed {_money(undisputed)} by value date to avoid default.")
+    else:
+        parts.append("Do not pay; the call is invalid pending resolution.")
+    if escalation_target:
+        parts.append(f"Escalate to {escalation_target}.")
+    return " ".join(parts)
+
+
+@app.post(
+    "/v1/disputes/analyze",
+    response_model=DisputeResponse,
+    tags=["Disputes"],
+    dependencies=[Depends(require_api_key)],
+)
+async def analyze_dispute(req: DisputeRequest):
+    """
+    Analyze a margin call dispute case.
+    Accepts margin_call_notice + internal_calculation + context.
+    Returns dispute detection, category, amounts, escalation recommendation.
+    Compatible with AAL-D-002 benchmark schema.
+    """
+    if not client:
+        raise HTTPException(status_code=503, detail="LLM client not configured")
+
+    t0 = time.time()
+    case_id = req.case_id or str(uuid.uuid4())
+
+    prompt_input = {
+        "margin_call_notice":   req.margin_call_notice.model_dump(exclude_none=True),
+        "internal_calculation": req.internal_calculation.model_dump(exclude_none=True),
+        "context":              req.context.model_dump(exclude_none=True),
+    }
+
+    try:
+        msg = await _messages_create_with_retry(
+            model=MODEL,
+            max_tokens=1024,
+            system=DISPUTE_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": "Case:\n" + json.dumps(prompt_input, indent=2)
+            }],
+        )
+        raw = re.sub(r"^```json\s*", "", msg.content[0].text.strip())
+        raw = re.sub(r"\s*```$", "", raw)
+        pred = _salvage_json(raw)
+        if not pred:
+            raise HTTPException(status_code=502, detail=f"LLM returned unparseable response: {raw[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM analysis failed: {e}")
+
+    primary = pred.get("primary") or None
+    category = (primary or {}).get("category")
+    field    = (primary or {}).get("field")
+    dispute_exists = bool(primary) and category != "DIS-CLEAN"
+
+    notice, internal = req.margin_call_notice, req.internal_calculation
+    haircut_rate = pred.get("csa_haircut_rate")
+
+    if dispute_exists:
+        correct  = _correct_call_amount(category, field, notice, internal, haircut_rate)
+        disputed = _disputed_call_amount(category, correct, notice, internal)
+        primary_detail = _detail(category, field, notice, internal, correct, disputed)
+        sec = pred.get("secondary") or None
+        if sec:
+            secondary_detail = _detail(sec.get("category"), sec.get("field"),
+                                       notice, internal, None, None)
+        else:
+            secondary_detail = None
+    else:
+        correct = disputed = None
+        primary_detail = secondary_detail = None
+
+    pay = _pay_undisputed(category, correct, dispute_exists)
+    esc = _escalation_required(category, correct, dispute_exists)
+    call = _num(notice.call_amount)
+    undisputed = call if not dispute_exists else _undisputed_amount(pay, correct, notice)
+    target = (pred.get("escalation_target") if dispute_exists else None)
+
+    return DisputeResponse(
+        case_id=case_id,
+        dispute_exists=dispute_exists,
+        primary_dispute=primary_detail,
+        secondary_dispute=secondary_detail,
+        recommended_action=_recommended_action(
+            dispute_exists, category, pay, disputed, undisputed, call, target),
+        escalation_required=esc,
+        escalation_target=target,
+        pay_undisputed=pay,
+        undisputed_amount=undisputed,
+        extraction_confidence=0.9,
+        processing_ms=int((time.time() - t0) * 1000),
+        model_version=API_VERSION,
+    )
+
